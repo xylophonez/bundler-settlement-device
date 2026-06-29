@@ -47,6 +47,7 @@ quote(Base, Size, Opts) ->
     ).
 
 charge(Base, Req, Amount, Opts) ->
+    SignOpts = wallet_opts(Opts),
     Account = account(Base, Opts),
     Recipient = recipient(Base, Opts),
     LedgerRecipient = ledger_recipient(Base, Recipient, Opts),
@@ -66,10 +67,10 @@ charge(Base, Req, Amount, Opts) ->
                 <<"recipient">> => LedgerRecipient,
                 <<"request">> => Req
             },
-            Opts
+            SignOpts
         ),
-    case hb_ao:resolve(Base#{ <<"device">> => LedgerDevice }, ChargeReq, Opts) of
-        {ok, _} -> withdraw_if_enabled(Base, Req, Amount, Recipient, Opts);
+    case hb_ao:resolve(Base#{ <<"device">> => LedgerDevice }, ChargeReq, SignOpts) of
+        {ok, _} -> withdraw_if_enabled(Base, Req, Amount, Recipient, SignOpts);
         Error -> Error
     end.
 
@@ -78,6 +79,7 @@ withdraw_if_enabled(Base, Req, Amount, Recipient, Opts) ->
         false ->
             {ok, Req};
         true ->
+            SignOpts = wallet_opts(Opts),
             AoPaymentDevice =
                 hb_maps:get(
                     <<"withdraw-device">>,
@@ -90,16 +92,21 @@ withdraw_if_enabled(Base, Req, Amount, Recipient, Opts) ->
                 <<"token">> => hb_maps:get(<<"withdraw-token">>, Base, undefined, Opts),
                 <<"quantity">> => Amount,
                 <<"recipient">> => Recipient,
-                <<"withdraw-secret">> => withdraw_secret(Base, Opts),
                 <<"withdraw-id">> => settlement_key(Req, Amount, Recipient, Opts),
                 <<"request">> => Req
             },
-            WithdrawReq =
-                case hb_maps:get(<<"token">>, WithdrawReq0, undefined, Opts) of
-                    undefined -> maps:remove(<<"token">>, WithdrawReq0);
-                    _ -> WithdrawReq0
+            WithdrawReqWithSecret =
+                case withdraw_secret(Base, SignOpts) of
+                    undefined -> WithdrawReq0;
+                    Secret -> WithdrawReq0#{<<"withdraw-secret">> => Secret}
                 end,
-            case hb_ao:resolve(Base#{ <<"device">> => AoPaymentDevice }, WithdrawReq, Opts) of
+            WithdrawReq1 =
+                case hb_maps:get(<<"token">>, WithdrawReqWithSecret, undefined, Opts) of
+                    undefined -> maps:remove(<<"token">>, WithdrawReqWithSecret);
+                    _ -> WithdrawReqWithSecret
+                end,
+            WithdrawReq = hb_message:commit(WithdrawReq1, SignOpts),
+            case hb_ao:resolve(Base#{ <<"device">> => AoPaymentDevice }, WithdrawReq, SignOpts) of
                 {ok, _} -> {ok, Req};
                 Error -> Error
             end
@@ -167,3 +174,56 @@ normalize_account(Account) when ?IS_ID(Account) ->
     hb_util:human_id(Account);
 normalize_account(Account) ->
     Account.
+
+wallet_opts(Opts) ->
+    Wallet =
+        case configured_wallet(Opts) of
+            not_found ->
+                hb:wallet(hb_opts:get(priv_key_location, <<"hyperbeam-key.json">>, Opts));
+            FoundWallet ->
+                FoundWallet
+        end,
+    Operator = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Opts#{
+        priv_wallet => Wallet,
+        <<"priv-wallet">> => Wallet,
+        operator => Operator,
+        <<"operator">> => Operator
+    }.
+
+configured_wallet(Opts) when is_map(Opts) ->
+    case maps:get(<<"priv-wallet">>, Opts, not_found) of
+        not_found -> maps:get(priv_wallet, Opts, not_found);
+        Wallet -> Wallet
+    end;
+configured_wallet(_Opts) ->
+    not_found.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+withdrawal_request_is_node_signed_test() ->
+    Wallet = ar_wallet:new(),
+    Operator = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Opts = #{priv_wallet => Wallet, <<"priv-wallet">> => Wallet, <<"operator">> => Operator},
+    Base = #{
+        <<"withdraw">> => true,
+        <<"withdraw-token">> => <<"0syT13r0s0tgPmIed95bJnuSqaD29HQNN8D3ElLSrsc">>,
+        <<"settlement-account">> => Operator
+    },
+    Recipient = hb_util:encode(crypto:strong_rand_bytes(32)),
+    SignOpts = wallet_opts(Opts),
+    WithdrawReq0 = #{
+        <<"path">> => <<"withdraw">>,
+        <<"token">> => hb_maps:get(<<"withdraw-token">>, Base, undefined, Opts),
+        <<"quantity">> => 7,
+        <<"recipient">> => Recipient,
+        <<"withdraw-id">> => settlement_key(#{<<"id">> => <<"item">>}, 7, Recipient, Opts)
+    },
+    WithdrawReq = hb_message:commit(WithdrawReq0, SignOpts),
+    Signers = [hb_util:human_id(Signer) || Signer <- hb_message:signers(WithdrawReq, SignOpts)],
+    ?assertEqual(true, hb_message:verify(WithdrawReq, signers, SignOpts)),
+    ?assert(lists:member(Operator, Signers)),
+    ?assertEqual(undefined, maps:get(<<"withdraw-secret">>, WithdrawReq, undefined)).
+
+-endif.
