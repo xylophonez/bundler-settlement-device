@@ -1,0 +1,8 @@
+{application, bundler_settlement_device, [
+    {description, "Standalone HyperBEAM bundler settlement device"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, []}
+]}.
